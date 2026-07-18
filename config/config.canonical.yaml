@@ -1,0 +1,141 @@
+OLLAMA_HOST: http://localhost:11434
+GOOSE_MODE: auto
+GOOSE_PROVIDER: ollama
+GOOSE_MODEL: qwen25-16k
+# Compactacao automatica de contexto: resume a conversa ao atingir 70% da janela
+GOOSE_AUTO_COMPACT_THRESHOLD: 0.6
+GOOSE_CONTEXT_LIMIT: 16384
+GOOSE_TOOL_PAIR_SUMMARIZATION: true
+GOOSE_MAX_TOOL_RESPONSE_SIZE: 16000
+GOOSE_TRUNCATED_SHOW_LINES: 80
+GOOSE_TELEMETRY_ENABLED: false
+
+# Somente extensoes essenciais -> prompt menor, menos RAM, tool-calling confiavel
+extensions:
+  developer:
+    enabled: true
+    type: builtin
+    name: developer
+    display_name: Developer
+    timeout: 300
+    bundled: true
+  computercontroller:
+    enabled: false
+    type: builtin
+    name: computercontroller
+    display_name: Computer Controller
+    timeout: 300
+    bundled: true
+  memory:
+    enabled: true
+    type: builtin
+    name: memory
+    display_name: Memory
+    timeout: 300
+    bundled: true
+  ddgsearch:
+    enabled: true
+    type: stdio
+    name: ddgsearch
+    cmd: /Users/carvalho/.local/bin/uvx
+    args:
+    - duckduckgo-mcp-server
+    display_name: Web Search (DuckDuckGo)
+    timeout: 120
+    bundled: false
+  deepweb:
+    enabled: false
+    type: stdio
+    name: deepweb
+    cmd: /Users/carvalho/.local/bin/uv
+    args:
+    - run
+    - --quiet
+    - --python
+    - "3.11"
+    - --with
+    - mcp
+    - --with
+    - httpx[socks]
+    - --with
+    - beautifulsoup4
+    - /Users/carvalho/.config/goose/mcp/deepweb/server.py
+    display_name: Deep Web (Tor)
+    timeout: 180
+    bundled: false
+  localrag:
+    enabled: true
+    type: stdio
+    name: localrag
+    cmd: /Users/carvalho/.local/bin/uv
+    args:
+    - run
+    - --quiet
+    - --python
+    - "3.11"
+    - --with
+    - mcp
+    - --with
+    - httpx
+    - /Users/carvalho/.config/goose/mcp/localrag/server.py
+    display_name: Local RAG (segundo cerebro)
+    timeout: 180
+    bundled: false
+  agentmem:
+    enabled: true
+    type: stdio
+    name: agentmem
+    cmd: /Users/carvalho/.local/bin/uv
+    args:
+    - run
+    - --quiet
+    - --python
+    - "3.11"
+    - --with
+    - mcp
+    - /Users/carvalho/.config/goose/mcp/agentmem/server.py
+    display_name: Memoria auto-gerida (MemGPT-style)
+    timeout: 120
+    bundled: false
+  raghatools:
+    enabled: false
+    type: stdio
+    name: raghatools
+    cmd: /Users/carvalho/.local/bin/uv
+    args:
+    - run
+    - --quiet
+    - --python
+    - "3.11"
+    - --with
+    - mcp
+    - /Users/carvalho/.config/goose/mcp/raghatools/server.py
+    display_name: Ragha Tools (plug/rotinas/skills/backup)
+    timeout: 120
+    bundled: false
+
+  mactools:
+    enabled: true
+    type: stdio
+    name: mactools
+    cmd: /Users/carvalho/.local/bin/uv
+    args:
+    - run
+    - --quiet
+    - --python
+    - "3.11"
+    - --with
+    - mcp
+    - /Users/carvalho/.config/goose/mcp/mactools/server.py
+    display_name: Mac Tools (browser/arquivos/apps)
+    timeout: 60
+    bundled: false
+providers:
+  ollama:
+    enabled: true
+    model: qwen25-16k
+    configured: true
+active_provider: ollama
+plugins:
+  /Users/carvalho/.agents/plugins/ragha-guard:
+    enabled: true

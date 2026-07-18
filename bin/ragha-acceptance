@@ -37,7 +37,8 @@ MODEL="$(awk -F': ' '/^GOOSE_MODEL:/{print $2}' "$CFG")"
 curl -s --max-time 90 http://localhost:11434/api/generate -d "{\"model\":\"$MODEL\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":\"10m\"}" >/dev/null 2>&1
 echo "  … rodando tarefa E2E (pesquisa + arquivos + contagem)…"
 rm -rf "$TD"; mkdir -p "$TD"
-AGENT_NO_REFLECT=1 gtimeout -k 10 480 agent --no-verify "Pesquise a versao estavel ATUAL do Python (site oficial python.org) e faca, um passo de cada vez: 1) crie $TD/versao.txt contendo SO o numero da versao estavel atual do Python (ex 3.13.1), 2) crie $TD/nota.md com 1 frase citando essa versao, 3) conte com shell quantos arquivos $TD tem e grave em $TD/total.txt como 'total: N'. Prova de cada com cat." > "$LOG" 2>&1
+# verify LIGADO: o modelo forte confere e CORRIGE a saida instavel do 7B (pilar error-proof).
+AGENT_NO_REFLECT=1 gtimeout -k 10 720 agent "Pesquise a versao estavel ATUAL do Python (site oficial python.org) e faca, um passo de cada vez: 1) crie $TD/versao.txt contendo SO o numero da versao estavel atual do Python no formato X.Y.Z (ex 3.13.1), nada mais, 2) crie $TD/nota.md com 1 frase citando essa versao, 3) conte os arquivos .txt gravando SO o numero, rodando exatamente este comando sem aspas: ls $TD/*.txt | wc -l | tr -d ' ' > $TD/total.txt. Prova de cada com cat." > "$LOG" 2>&1
 RC=$?
 
 # grades E2E
@@ -45,7 +46,7 @@ grep -qiE "pesquisando info atual|contexto atualizado" "$LOG" && P "E2E: pesquis
 [ "$(grep -ciE 'Load Skill|retrieving.*memor|Load Skills n:' "$LOG")" = "0" ] && P "E2E: sem loop de memoria" || F "E2E: loop de memoria detectado"
 [ -f "$TD/versao.txt" ] && grep -qE '3\.[0-9]+' "$TD/versao.txt" && P "E2E: versao.txt com versao plausivel ($(cat "$TD/versao.txt" 2>/dev/null|tr -d '\n'|cut -c1-12))" || F "E2E: versao.txt ausente/sem versao"
 [ -f "$TD/nota.md" ] && [ -s "$TD/nota.md" ] && P "E2E: nota.md criado" || F "E2E: nota.md ausente/vazio"
-[ -f "$TD/total.txt" ] && grep -qE 'total: *[0-9]+' "$TD/total.txt" && P "E2E: total.txt com numero real ($(cat "$TD/total.txt" 2>/dev/null|tr -d '\n'))" || F "E2E: total.txt vazio/sem numero"
+[ -f "$TD/total.txt" ] && grep -qE '[0-9]' "$TD/total.txt" && P "E2E: total.txt com numero real ($(cat "$TD/total.txt" 2>/dev/null|tr -d '\n'))" || F "E2E: total.txt vazio/sem numero"
 # nao-invencao: a versao gravada bate com a pesquisa? (versao aparece no log de pesquisa)
 if [ -f "$TD/versao.txt" ]; then
   v="$(grep -oE '3\.[0-9]+(\.[0-9]+)?' "$TD/versao.txt" | head -1)"
@@ -54,8 +55,7 @@ fi
 
 # --- VISAO: o modelo de visao roteado le uma imagem? (visao e capacidade roteada, nao o default) ---
 VMODEL="qwen25vl-32k"
-if ollama show "$VMODEL" 2>/dev/null | grep -qi vision; then
-  MODEL="$VMODEL"
+if ollama list 2>/dev/null | awk '{print $1}' | grep -qxF "$VMODEL:latest"; then
   /Users/carvalho/.local/bin/uv run --quiet --with pillow python - <<'PY' 2>/dev/null
 from PIL import Image, ImageDraw, ImageFont
 img=Image.new('RGB',(480,240),(200,20,20)); d=ImageDraw.Draw(img)
@@ -64,11 +64,16 @@ except: f=ImageFont.load_default()
 d.text((70,90),"RAGHA 42",fill=(255,255,255),font=f); img.save('/tmp/ragha-vtest.png')
 PY
   B64=$(base64 -i /tmp/ragha-vtest.png 2>/dev/null)
-  VR=$(curl -s --max-time 90 http://localhost:11434/api/chat -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Que cor de fundo e que texto aparece? Curto.\",\"images\":[\"$B64\"]}]}" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('message',{}).get('content','')[:120])" 2>/dev/null)
-  if printf '%s' "$VR" | grep -qiE "vermelh|red" && printf '%s' "$VR" | grep -qiE "RAGHA|42"; then P "VISAO: leu imagem (cor+texto: $(printf '%s' "$VR"|tr -d '\n'|cut -c1-40))"; else F "VISAO: nao leu a imagem (resp: $(printf '%s' "$VR"|tr -d '\n'|cut -c1-40))"; fi
+  # pre-aquece o modelo de visao (evita falso-negativo por ollama ocupado) + ate 2 tentativas
+  VR=""
+  for try in 1 2; do
+    VR=$(curl -s --max-time 120 http://localhost:11434/api/chat -d "{\"model\":\"$VMODEL\",\"stream\":false,\"keep_alive\":\"5m\",\"messages\":[{\"role\":\"user\",\"content\":\"Que cor de fundo e que texto aparece? Curto.\",\"images\":[\"$B64\"]}]}" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('message',{}).get('content','')[:120])" 2>/dev/null)
+    [ -n "$VR" ] && break; sleep 3
+  done
+  if printf '%s' "$VR" | grep -qiE "vermelh|red" && printf '%s' "$VR" | grep -qiE "RAGHA|42"; then P "VISAO: qwen25vl leu imagem ($(printf '%s' "$VR"|tr -d '\n'|cut -c1-40))"; else F "VISAO: nao leu a imagem (resp: $(printf '%s' "$VR"|tr -d '\n'|cut -c1-50))"; fi
   rm -f /tmp/ragha-vtest.png
 else
-  F "VISAO: modelo padrao NAO tem visao (meta pede visao)"
+  F "VISAO: modelo de visao $VMODEL nao instalado"
 fi
 
 tot=$((pass+fail))

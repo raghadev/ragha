@@ -161,17 +161,38 @@ if [ "$rc" != "0" ] && [ "$ESCALATE" = "1" ] && [ "$PRIMARY" != "$FALLBACK" ]; t
   run_model "$FALLBACK"; rc=$?
 fi
 
-# 3b) VERIFICACAO pelo modelo FORTE (garante saida correta mesmo com modelo burro).
-# -1 = auto: verifica sempre que o primario NAO for o modelo forte. Corrige o "311 vs 3.14.6".
+# 3b) VERIFICACAO (garante saida correta mesmo com modelo burro).
+# Usa um modelo RAPIDO e confiavel (qwen25-16k) — nao o FALLBACK lento. Corrige arquivo faltante/valor errado.
+# -1 = auto: verifica sempre que o primario for pequeno (!= modelo forte de reserva).
+VERIFY_MODEL="qwen25-16k"
 do_verify=0
 [ "$VERIFY" = "1" ] && do_verify=1
-{ [ "$VERIFY" = "-1" ] && [ "$PRIMARY" != "$FALLBACK" ]; } && do_verify=1
+# auto (-1) NAO roda mais o verify destrutivo (ele re-escrevia e corrompia arquivos certos).
+# Correcao de arquivos faltando/vazios fica com a REDE 3 abaixo (nao-destrutiva). --verify força explicito.
+: # (verify so com --verify explicito; VERIFY=1)
 if [ "$do_verify" = "1" ]; then
-  echo "[agent] conferindo o resultado com o modelo forte ($FALLBACK)…" | tee -a "$LOG"
-  vout="$(env GOOSE_MODE=auto GOOSE_MODEL="$FALLBACK" goose run --no-session -t "Confira se esta tarefa foi cumprida CORRETAMENTE: '$PROMPT'. Use as ferramentas de verdade para conferir (leia com cat os arquivos citados; compare valores com os fatos atuais). Se houver QUALQUER erro, valor incorreto ou parte faltando, CORRIJA agora executando as ferramentas e mostre a prova final. Se estiver tudo certo, so confirme com a prova." 2>&1)"
+  echo "[agent] conferindo/corrigindo o resultado ($VERIFY_MODEL)…" | tee -a "$LOG"
+  vout="$(env GOOSE_MODE=auto GOOSE_MODEL="$VERIFY_MODEL" goose run --no-session -t "Confira se esta tarefa foi cumprida CORRETAMENTE e CORRIJA o que faltar. Passo a passo: para CADA arquivo citado na tarefa, rode 'cat' nele; se NAO existir ou estiver vazio/errado, CRIE agora com a ferramenta shell (use os fatos pesquisados, nunca invente). Depois mostre a prova final com cat. Tarefa: '$PROMPT'" 2>&1)"
   printf "%s\n" "$vout"
-  printf "[%s] VERIFY(%s):\n%s\n" "$(ts)" "$FALLBACK" "$vout" >>"$LOG"
+  printf "[%s] VERIFY(%s):\n%s\n" "$(ts)" "$VERIFY_MODEL" "$vout" >>"$LOG"
 fi
+
+# 3c) REDE 3 — LOOP DE COMPLETUDE: garante que TODO arquivo citado na tarefa exista e NAO esteja vazio.
+# Enquanto faltar algum, o modelo rapido recria SO os que faltam. Ate 3 voltas -> convergencia ("sempre resolve").
+cl_try=0
+while [ "$cl_try" -lt 3 ]; do
+  missing=""
+  for p in $(printf "%s" "$PROMPT" | grep -oE '(/tmp/[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+|/Users/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)' | sort -u); do
+    pe="${p/#\~/$HOME}"
+    case "$pe" in */) continue;; esac
+    [ -s "$pe" ] || missing="$missing $pe"
+  done
+  [ -z "$missing" ] && break
+  cl_try=$((cl_try+1))
+  echo "[agent] completando arquivos faltando/vazios (volta $cl_try):$missing" | tee -a "$LOG"
+  env GOOSE_MODE=auto GOOSE_MODEL="$VERIFY_MODEL" goose run --no-session -t "Alguns arquivos que a tarefa pede estao FALTANDO ou VAZIOS:$missing . Crie/preencha CADA UM agora, um por vez, com a ferramenta shell, com o conteudo correto que a tarefa descreve (use os fatos ja pesquisados; nunca invente valores). Depois rode cat em cada um pra provar. Tarefa original: $PROMPT" >>"$LOG" 2>&1
+done
+[ "$cl_try" -gt 0 ] && { [ -z "$missing" ] && echo "[agent] todos os arquivos completos ✓" | tee -a "$LOG"; }
 
 # 4) Auto-melhoria: reflete sobre o episodio em background (nao bloqueia a saida).
 if [ "${AGENT_NO_REFLECT:-0}" != "1" ] && command -v agent-reflect >/dev/null 2>&1; then

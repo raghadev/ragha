@@ -25,13 +25,40 @@ def main():
         print(f"[research falhou: {e}]"); return
     if not results:
         return
-    # CONCISO (modelo pequeno afoga com muito texto): so 3 resultados, snippet curto, sem excerto grande.
     out = ["FATOS ATUAIS DA WEB (use estes; nao a memoria de treino):"]
+    urls = []
     for r in results[:3]:
         t = (r.get("title") or "").strip()[:70]
         u = (r.get("href") or r.get("url") or "").strip()
         b = re.sub(r"\s+", " ", (r.get("body") or "")).strip()[:110]
         out.append(f"- {t}: {b} [{u}]")
+        if u:
+            urls.append(u)
+    # TRECHO DA PAGINA: busca o conteudo do 1o resultado -> o dado (versao/numero/preco) fica presente
+    # mesmo quando o snippet nao traz. Prioriza linhas com numeros/versoes (mais informativas).
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+        for u in urls[:2]:
+            try:
+                html = httpx.get(u, timeout=8, follow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0"}).text
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
+                    tag.extract()
+                text = re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+                # frases com numero/versao primeiro (ex "Python 3.13.1", "latest 3.13")
+                sents = re.split(r"(?<=[.!?])\s+", text)
+                hot = [s for s in sents if re.search(r"\d+\.\d+", s)][:4]
+                excerpt = " ".join(hot) if hot else text[:400]
+                excerpt = excerpt[:500]
+                if excerpt:
+                    out.append(f"TRECHO DA PAGINA [{u}]: {excerpt}")
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
     print("\n".join(out))
 
 
