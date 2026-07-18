@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+REAL=/bin/dd
+for a in "$@"; do case "$a" in of=/dev/*) echo "[guardbin] BLOQUEADO: dd escrevendo em dispositivo -> $a" >&2; exit 13;; esac; done
+exec "$REAL" "$@"

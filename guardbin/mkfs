@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "[guardbin] BLOQUEADO: 'mkfs' (formatar/apagar disco) precisa ser manual." >&2
+exit 13

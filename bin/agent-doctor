@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# agent-doctor — preflight de saude do stack do agente local. Auto-repara o que da.
+# Uso: agent-doctor [--model NOME] [--deepweb]
+set -uo pipefail
+
+CFG="$HOME/.config/goose/config.yaml"
+WANT_TOR=0
+MODEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2;;
+    --deepweb) WANT_TOR=1; shift;;
+    *) shift;;
+  esac
+done
+[ -z "$MODEL" ] && MODEL="$(awk -F': ' '/^GOOSE_MODEL:/{print $2}' "$CFG" 2>/dev/null)"
+
+ok(){   printf "  \033[32mOK\033[0m   %s\n" "$1"; }
+fix(){  printf "  \033[33mFIX\033[0m  %s\n" "$1"; }
+bad(){  printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
+
+RC=0
+echo "== agent-doctor =="
+
+# 0) Auto-repatch do Goose Desktop (se update reverteu o binario)
+command -v agent-repatch >/dev/null 2>&1 && agent-repatch 2>/dev/null | grep -q "re-aplicado" && fix "Goose Desktop re-patchado (update havia revertido)"
+
+# 0) Guardiao de config: restaura se o Goose Desktop (ou algo) causou drift
+if command -v agent-config-guard >/dev/null 2>&1; then
+  if agent-config-guard; then :; else fix "config restaurado do canonical (havia drift)"; fi
+fi
+
+# 1) Ollama runtime
+if ! curl -s --max-time 3 http://localhost:11434/api/version >/dev/null 2>&1; then
+  fix "Ollama fora do ar -> iniciando serviço"
+  brew services start ollama >/dev/null 2>&1
+  for i in $(seq 1 20); do curl -s --max-time 2 http://localhost:11434/api/version >/dev/null 2>&1 && break; sleep 1; done
+fi
+if curl -s --max-time 3 http://localhost:11434/api/version >/dev/null 2>&1; then ok "Ollama no ar"; else bad "Ollama não sobe"; RC=1; fi
+
+# 2) Modelo presente
+if [ -n "$MODEL" ]; then
+  if ollama list 2>/dev/null | awk '{print $1}' | sed 's/:latest$//' | grep -qxF "${MODEL%:latest}"; then
+    ok "Modelo presente: $MODEL"
+  else
+    bad "Modelo ausente: $MODEL  (rode: ollama pull $MODEL  ou crie a variante 16k)"; RC=1
+  fi
+else
+  fix "GOOSE_MODEL não definido no config"
+fi
+
+# 3) Tor (só se deepweb pedido)
+if [ "$WANT_TOR" = "1" ]; then
+  if ! nc -z 127.0.0.1 9050 2>/dev/null; then
+    fix "Tor fora do ar -> iniciando serviço"; brew services start tor >/dev/null 2>&1
+    for i in $(seq 1 30); do nc -z 127.0.0.1 9050 2>/dev/null && break; sleep 1; done
+  fi
+  if nc -z 127.0.0.1 9050 2>/dev/null; then ok "Tor SOCKS 9050 no ar"; else bad "Tor não sobe (deepweb indisponível)"; RC=1; fi
+fi
+
+# 4) Dependências do MCP deepweb
+if /Users/carvalho/.local/bin/uv run --quiet --python 3.11 --with mcp --with "httpx[socks]" --with beautifulsoup4 python -c "import mcp, httpx, bs4, socksio" >/dev/null 2>&1; then
+  ok "Deps deepweb (mcp, httpx[socks], bs4) resolvem"
+else
+  fix "Deps deepweb ainda não em cache (1ª execução baixa; ok)"
+fi
+
+# 5) Config valido (YAML basico)
+if python3 -c "import sys,yaml" >/dev/null 2>&1; then
+  python3 -c "import yaml,sys; yaml.safe_load(open('$CFG'))" >/dev/null 2>&1 && ok "config.yaml válido" || { bad "config.yaml inválido"; RC=1; }
+else
+  grep -q "^GOOSE_MODEL:" "$CFG" 2>/dev/null && ok "config.yaml presente" || { bad "config.yaml sem GOOSE_MODEL"; RC=1; }
+fi
+
+[ "$RC" = "0" ] && echo "== stack SAUDÁVEL ==" || echo "== há falhas acima =="
+exit $RC

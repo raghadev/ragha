@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+agent-mem v2 — memoria de licoes recuperavel, estado da arte 2026.
+- Retrieval MULTI-SINAL: semantico (cosseno) + keyword (BM25-lite) + entidade, fundidos.
+- Esquecimento FSRS/Ebbinghaus: retrievability R=exp(-idade/stability); stability cresce com uso.
+- NAMESPACES: memoria por projeto (--ns), alem da global.
+- CONSOLIDATE: funde near-dups + poda por curva de esquecimento + teto.
+- DISTILL (sleep-time): LLM funde licoes similares em regras mais afiadas.
+- METRICS e EXPORT-GRAPH (graphify).
+
+Uso:
+  add "<licao>" [--ns X]
+  recall "<query>" [k] [--ns X]
+  inject "<query>" [k] [--ns X]     escreve top-k no bloco LICOES do .goosehints
+  consolidate [--ns X]
+  distill [--ns X]                  merge via LLM de grupos similares
+  metrics
+  export-graph [arquivo]
+  migrate
+  stats
+"""
+import sys, os, re, json, time, math, sqlite3, struct, urllib.request
+
+DB = os.path.expanduser("~/.local/share/agent/rag.db")
+HINTS = os.path.expanduser("~/.config/goose/.goosehints")
+GRAPH_OUT = os.path.expanduser("~/.local/share/agent/lessons-graph.json")
+OLLAMA_EMBED = "http://localhost:11434/api/embed"
+OLLAMA_CHAT = "http://localhost:11434/api/chat"
+EMBED_MODEL = "nomic-embed-text"
+DISTILL_MODEL = os.environ.get("REFLECT_MODEL", "gemma4-unc-16k")
+BEGIN, END = "<!-- LICOES:INICIO -->", "<!-- LICOES:FIM -->"
+DEDUP_ADD, DEDUP_MERGE, SIM_EDGE = 0.90, 0.93, 0.80
+CAP = 300
+S0 = 3.0          # stability inicial (dias)
+S_GROW = 1.7      # multiplicador de stability por uso
+R_PRUNE = 0.12    # abaixo disso e "esquecida" (se pouco usada)
+W_SEM, W_KW, W_ENT = 0.60, 0.25, 0.15
+STOP = set("a o as os de do da dos das e ou que para por com sem no na nos nas um uma "
+           "the a an to of for and or with in on is use usar para".split())
+
+
+def db():
+    con = sqlite3.connect(DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS lessons(
+        id INTEGER PRIMARY KEY, ns TEXT DEFAULT 'global', text TEXT, vec BLOB,
+        created REAL, uses INTEGER DEFAULT 0, last_used REAL, stability REAL DEFAULT 3.0)""")
+    # migracao suave se tabela antiga
+    cols = [r[1] for r in con.execute("PRAGMA table_info(lessons)").fetchall()]
+    for c, d in (("ns", "TEXT DEFAULT 'global'"), ("stability", "REAL DEFAULT 3.0")):
+        if c not in cols:
+            con.execute(f"ALTER TABLE lessons ADD COLUMN {c} {d}")
+    con.commit()
+    return con
+
+
+def embed(texts):
+    r = urllib.request.Request(OLLAMA_EMBED, json.dumps({"model": EMBED_MODEL, "input": texts}).encode(), {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(r, timeout=120))["embeddings"]
+
+
+def chat(system, user):
+    body = json.dumps({"model": DISTILL_MODEL, "stream": False,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}).encode()
+    r = urllib.request.Request(OLLAMA_CHAT, body, {"Content-Type": "application/json"})
+    txt = json.load(urllib.request.urlopen(r, timeout=240))["message"]["content"]
+    return re.sub(r"<think>.*?</think>", "", txt, flags=re.S)
+
+
+def pack(v): return struct.pack(f"{len(v)}f", *v)
+def unpack(b): return list(struct.unpack(f"{len(b)//4}f", b))
+def cos(a, b):
+    d = sum(x*y for x, y in zip(a, b)); na = sum(x*x for x in a)**.5; nb = sum(y*y for y in b)**.5
+    return d/(na*nb+1e-9)
+
+
+def toks(s):
+    return [t for t in re.findall(r"[\w/\.\-]+", s.lower()) if t not in STOP and len(t) > 1]
+
+
+def ents(s):
+    # "entidades": tool names, paths, flags, backticks, CamelCase, com _ / . /
+    e = set(re.findall(r"`([^`]+)`", s))
+    e |= set(re.findall(r"[A-Za-z0-9_\-]+(?:[_/\.][A-Za-z0-9_\-]+)+", s))
+    e |= set(re.findall(r"\b[a-z]+_[a-z_]+\b", s))
+    return {x.lower() for x in e if len(x) > 2}
+
+
+def retrievability(created, last_used, uses, stability):
+    ref = last_used or created or time.time()
+    age_days = max(0.0, (time.time() - ref) / 86400.0)
+    S = max(0.5, stability or S0)
+    return math.exp(-age_days / S)
+
+
+def _ns_filter(ns):
+    # ns especifico busca no ns + global; global busca so global
+    return ("global",) if ns == "global" else (ns, "global")
+
+
+def cmd_add(text, ns="global"):
+    text = text.strip()
+    if len(text) < 5: return
+    try: v = embed([text])[0]
+    except Exception as e: print("mem: erro embed:", e); return
+    con = db()
+    for (vb,) in con.execute("SELECT vec FROM lessons WHERE ns=?", (ns,)).fetchall():
+        if cos(v, unpack(vb)) > DEDUP_ADD:
+            con.close(); print("mem: duplicada, ignorada."); return
+    now = time.time()
+    con.execute("INSERT INTO lessons(ns,text,vec,created,uses,last_used,stability) VALUES(?,?,?,?,0,?,?)",
+                (ns, text, pack(v), now, now, S0))
+    con.commit(); con.close(); print("mem: +1 licao")
+
+
+def _rank(query, ns, k, bump):
+    try: qv = embed([query])[0]
+    except Exception as e: print("mem: erro embed:", e, file=sys.stderr); return []
+    qt = set(toks(query)); qe = ents(query)
+    con = db()
+    q = "SELECT id,text,vec,created,uses,last_used,stability FROM lessons WHERE ns IN (%s)" % ",".join("?" * len(_ns_filter(ns)))
+    rows = con.execute(q, _ns_filter(ns)).fetchall()
+    if not rows: con.close(); return []
+    scored = []
+    for i, t, vb, created, uses, lu, stab in rows:
+        sem = max(0.0, cos(qv, unpack(vb)))
+        lt = set(toks(t))
+        kw = len(qt & lt) / (len(qt) + 1e-9)
+        le = ents(t)
+        ent = (len(qe & le) / (len(qe) + 1e-9)) if qe else 0.0
+        base = W_SEM * sem + W_KW * kw + W_ENT * ent
+        R = retrievability(created, lu, uses, stab)
+        score = base * (0.5 + 0.5 * R)   # licao "esquecida" cai no ranking
+        scored.append((score, i, t))
+    scored.sort(reverse=True)
+    top = scored[:k]
+    if bump:
+        now = time.time()
+        for _, i, _ in top:
+            con.execute("UPDATE lessons SET uses=uses+1,last_used=?,stability=stability*? WHERE id=?", (now, S_GROW, i))
+        con.commit()
+    con.close()
+    return [t for _, _, t in top]
+
+
+def cmd_recall(query, k=5, ns="global"): return _rank(query, ns, k, True)
+
+
+def write_block(lines):
+    h = open(HINTS, encoding="utf-8").read()
+    m = re.search(re.escape(BEGIN)+r"(.*?)"+re.escape(END), h, flags=re.S)
+    if not m: return False
+    block = BEGIN+"\n"+"\n".join("- "+l for l in lines)+"\n"+END if lines else BEGIN+"\n"+END
+    open(HINTS, "w", encoding="utf-8").write(h[:m.start()]+block+h[m.end():]); return True
+
+
+def cmd_inject(query, k=5, ns="global"):
+    lessons = cmd_recall(query, k, ns); write_block(lessons)
+    print(f"mem: injetadas {len(lessons)} licoes relevantes (ns={ns})")
+
+
+def cmd_consolidate(ns=None):
+    con = db(); removed = merged = capped = 0
+    where = "WHERE ns=?" if ns else ""
+    args = (ns,) if ns else ()
+    rows = con.execute(f"SELECT id,vec,created,uses,last_used,stability FROM lessons {where}", args).fetchall()
+    # 1) esquecimento: R baixa e pouco usada
+    for i, vb, created, uses, lu, stab in rows:
+        if uses <= 1 and retrievability(created, lu, uses, stab) < R_PRUNE:
+            con.execute("DELETE FROM lessons WHERE id=?", (i,)); removed += 1
+    con.commit()
+    # 2) merge near-dups: mantem maior uso
+    rows = con.execute(f"SELECT id,vec FROM lessons {where} ORDER BY uses DESC, last_used DESC", args).fetchall()
+    keep = []
+    for i, vb in rows:
+        v = unpack(vb)
+        if any(cos(v, unpack(kb)) > DEDUP_MERGE for _, kb in keep):
+            con.execute("DELETE FROM lessons WHERE id=?", (i,)); merged += 1
+        else: keep.append((i, vb))
+    con.commit()
+    # 3) teto
+    ids = [r[0] for r in con.execute("SELECT id FROM lessons ORDER BY uses DESC, last_used DESC").fetchall()]
+    for i in ids[CAP:]:
+        con.execute("DELETE FROM lessons WHERE id=?", (i,)); capped += 1
+    con.commit()
+    n = con.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]; con.close()
+    print(f"mem consolidate: podadas={removed} merged={merged} capped={capped} restam={n}")
+
+
+def cmd_distill(ns=None):
+    """Sleep-time: agrupa licoes similares (cos>0.82) e pede ao LLM 1 regra mais afiada."""
+    con = db()
+    where = "WHERE ns=?" if ns else ""; args = (ns,) if ns else ()
+    rows = con.execute(f"SELECT id,text,vec,ns FROM lessons {where}", args).fetchall()
+    used = set(); groups = []
+    for a in range(len(rows)):
+        if rows[a][0] in used: continue
+        gi = [rows[a]]; used.add(rows[a][0]); va = unpack(rows[a][2])
+        for b in range(a+1, len(rows)):
+            if rows[b][0] in used: continue
+            if cos(va, unpack(rows[b][2])) > 0.82:
+                gi.append(rows[b]); used.add(rows[b][0])
+        if len(gi) > 1: groups.append(gi)
+    if not groups:
+        con.close(); print("mem distill: nada a fundir."); return
+    fused = 0
+    for g in groups:
+        texts = "\n".join("- "+x[1] for x in g)
+        try:
+            out = chat("Voce funde licoes operacionais redundantes em UMA regra unica, curta (max 100 chars), "
+                       "imperativa e generica. Responda SO a regra, sem '- ', sem explicacao.", texts)
+        except Exception as e:
+            print("mem distill: erro LLM:", e); continue
+        rule = out.strip().splitlines()[0].strip().lstrip("- ").strip()[:120]
+        if len(rule) < 5: continue
+        gns = g[0][3]
+        for x in g: con.execute("DELETE FROM lessons WHERE id=?", (x[0],))
+        con.commit()
+        cmd_add(rule, gns); fused += 1
+    con.close(); print(f"mem distill: {len(groups)} grupo(s) -> {fused} regra(s) fundida(s)")
+
+
+def cmd_metrics():
+    con = db()
+    n = con.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
+    used = con.execute("SELECT COUNT(*) FROM lessons WHERE uses>0").fetchone()[0]
+    byns = con.execute("SELECT ns,COUNT(*) FROM lessons GROUP BY ns").fetchall()
+    top = con.execute("SELECT text,uses FROM lessons ORDER BY uses DESC LIMIT 5").fetchall()
+    con.close()
+    print(f"== agent-mem metrics ==\n total={n}  usadas={used}  hit-rate={ (used/n*100 if n else 0):.0f}%")
+    print(" por namespace: " + ", ".join(f"{ns}={c}" for ns, c in byns))
+    print(" top usadas:"); [print(f"   {u}x  {t[:70]}") for t, u in top]
+
+
+def cmd_export_graph(path=GRAPH_OUT):
+    con = db()
+    rows = con.execute("SELECT id,text,vec,ns,uses FROM lessons").fetchall(); con.close()
+    nodes = [{"id": i, "label": t[:80], "ns": ns, "uses": u} for i, t, vb, ns, u in rows]
+    edges = []
+    for a in range(len(rows)):
+        va = unpack(rows[a][2])
+        for b in range(a+1, len(rows)):
+            s = cos(va, unpack(rows[b][2]))
+            if s > SIM_EDGE:
+                edges.append({"source": rows[a][0], "target": rows[b][0], "weight": round(s, 3)})
+    json.dump({"nodes": nodes, "edges": edges}, open(path, "w"), ensure_ascii=False, indent=2)
+    print(f"mem: grafo exportado ({len(nodes)} nos, {len(edges)} arestas) -> {path}")
+
+
+def cmd_migrate():
+    try: h = open(HINTS, encoding="utf-8").read()
+    except: return
+    m = re.search(re.escape(BEGIN)+r"(.*?)"+re.escape(END), h, flags=re.S)
+    if not m: print("mem: bloco nao encontrado"); return
+    lines = [l.strip()[2:].strip() for l in m.group(1).splitlines() if l.strip().startswith("- ")]
+    for l in lines: cmd_add(l)
+    print(f"mem: migradas {len(lines)} licoes")
+
+
+def cmd_forget(query, ns="global"):
+    """Esquece (remove) a licao mais parecida com a query. Usado pelo modelo (MemGPT-style)."""
+    try: qv = embed([query])[0]
+    except Exception as e: print("mem: erro embed:", e); return
+    con = db()
+    rows = con.execute("SELECT id,text,vec FROM lessons WHERE ns IN (%s)" % ",".join("?"*len(_ns_filter(ns))), _ns_filter(ns)).fetchall()
+    if not rows: con.close(); print("mem: store vazio"); return
+    best = max(rows, key=lambda r: cos(qv, unpack(r[2])))
+    con.execute("DELETE FROM lessons WHERE id=?", (best[0],)); con.commit(); con.close()
+    print(f"mem: esquecida -> {best[1][:80]}")
+
+
+def cmd_stats():
+    con = db(); n = con.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
+    used = con.execute("SELECT COUNT(*) FROM lessons WHERE uses>0").fetchone()[0]; con.close()
+    print(f"mem: {n} licoes no store ({used} ja usadas). DB={DB}")
+
+
+def pop_ns(argv):
+    ns = "global"
+    if "--ns" in argv:
+        i = argv.index("--ns"); ns = argv[i+1]; del argv[i:i+2]
+    return ns
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv: print(__doc__); return
+    ns = pop_ns(argv)
+    c = argv[0]
+    if c == "add" and len(argv) > 1: cmd_add(argv[1], ns)
+    elif c == "recall" and len(argv) > 1: print("\n".join("- "+l for l in cmd_recall(argv[1], int(argv[2]) if len(argv) > 2 else 5, ns)))
+    elif c == "inject" and len(argv) > 1: cmd_inject(argv[1], int(argv[2]) if len(argv) > 2 else 5, ns)
+    elif c == "consolidate": cmd_consolidate(None if ns == "global" else ns)
+    elif c == "distill": cmd_distill(None if ns == "global" else ns)
+    elif c == "forget" and len(argv) > 1: cmd_forget(argv[1], ns)
+    elif c == "metrics": cmd_metrics()
+    elif c == "export-graph": cmd_export_graph(argv[1] if len(argv) > 1 else GRAPH_OUT)
+    elif c == "migrate": cmd_migrate()
+    elif c == "stats": cmd_stats()
+    else: print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

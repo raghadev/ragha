@@ -1,0 +1,27 @@
+version: "1.0.0"
+title: "Diagnostico do Modelo"
+description: "Verifica o modelo ligado agora: chama ferramentas? pensa demais (thinking-loop)? estoura contexto? velocidade? E mostra os fixes recomendados com fontes."
+
+parameters:
+  - key: modelo
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "Nome do modelo a testar (vazio = o modelo padrao atual)"
+
+prompt: |
+  Rode o diagnostico do modelo e me mostre o resultado de forma leiga.
+  Passo unico: chame a ferramenta shell com o comando exato:
+    agent-modelcheck {{ modelo }}
+  Espere a saida real e cole ela inteira. Depois resuma em 3 linhas:
+  (1) o modelo serve pro agente? (2) tem algum problema? (3) qual o fix recomendado.
+  Se aparecer THINKING-LOOP, avise que o botao "Desligar pensamento" chega no proximo update do app,
+  e cite a fonte "Ollama /api/chat aceita think:false".
+
+instructions: |
+  Voce so executa `agent-modelcheck {{ modelo }}` via shell e reporta a saida real + um resumo curto.
+  NAO invente numeros; use exatamente o que o comando imprimiu. Uma chamada de ferramenta, uma saida, um resumo.
+
+activities:
+  - "Diagnosticar o modelo ligado agora"
+  - "Esse modelo tem algum problema?"

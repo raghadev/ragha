@@ -1,0 +1,4 @@
+*.log
+moim.txt
+.DS_Store
+__pycache__/

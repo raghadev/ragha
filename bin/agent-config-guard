@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# agent-config-guard — protege o config do harness contra drift (ex: Goose Desktop
+# reescreve config.yaml e religa ~15 extensoes de plataforma, inchando o prompt).
+# Se as 4 MCPs custom sumirem/forem desabilitadas ou o modelo ficar vazio, RESTAURA
+# o canonical (com backup). Chamado pelo agent-doctor.
+set -uo pipefail
+LIVE="$HOME/.config/goose/config.yaml"
+CANON="$HOME/.config/agent/config.canonical.yaml"
+[ -f "$CANON" ] || exit 0   # sem canonical, nada a fazer
+
+need_restore=0
+# modelo definido?
+grep -qE "^GOOSE_MODEL:[[:space:]]*\S" "$LIVE" 2>/dev/null || need_restore=1
+# 4 MCPs custom presentes?
+for mcp in ddgsearch deepweb localrag agentmem raghatools mactools; do
+  grep -qE "^[[:space:]]*name:[[:space:]]*$mcp$" "$LIVE" 2>/dev/null || need_restore=1
+done
+# platform extensions do Desktop religadas? (sinal de drift que incha o prompt)
+if grep -qE "^[[:space:]]*name:[[:space:]]*(summon|analyze|extensionmanager|todo|tom)$" "$LIVE" 2>/dev/null; then
+  need_restore=1
+fi
+
+if [ "$need_restore" = "1" ]; then
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp "$LIVE" "$HOME/.config/agent/config.drift-$ts.yaml" 2>/dev/null
+  cp "$CANON" "$LIVE"
+  echo "[config-guard] drift detectado -> config restaurado do canonical (backup: config.drift-$ts.yaml)"
+  exit 1
+fi
+exit 0

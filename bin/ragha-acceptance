@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# ragha-acceptance — bateria de ACEITACAO da meta: sempre pesquisa, nao inventa,
+# resolve passo-a-passo, sem loop, sem prompt, tarefa completa 100%. Alvo: 100% PASS.
+# Uso: ragha-acceptance
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+CFG="$HOME/.config/goose/config.yaml"
+GB="$HOME/.config/agent/guardbin"
+TD=/tmp/ragha-acc; LOG=/tmp/ragha-acc.log
+pass=0; fail=0; FAILS=""
+P(){ printf "  \033[32mPASS\033[0m %s\n" "$1"; pass=$((pass+1)); }
+F(){ printf "  \033[31mFAIL\033[0m %s\n" "$1"; fail=$((fail+1)); FAILS="$FAILS\n   - $1"; }
+
+echo "== ragha-acceptance =="
+
+# --- estaticos (rapidos) ---
+grep -q "^GOOSE_MODE: auto" "$CFG" && P "modo auto (sem prompts)" || F "GOOSE_MODE nao e auto"
+grep -q "^GOOSE_MODEL:" "$CFG" && P "modelo padrao definido" || F "sem GOOSE_MODEL"
+( export PATH="$GB:$PATH"; rm -rf / 2>/dev/null ) && F "guardbin: rm -rf / NAO bloqueado" || P "guardbin bloqueia rm -rf /"
+# extensoes de loop desligadas
+python3 - "$CFG" <<'PY' && echo -n || true
+import re,sys
+s=open(sys.argv[1]).read()
+m=re.search(r'extensions:\s*\n(.*?)(?:\n[a-z_]+:\s*\n|\Z)',s,re.S)
+on=[n for n,b in re.findall(r'\n  ([a-z_]+):\s*\n((?:    .*\n?)*)',m.group(1)) if 'enabled: true' in b]
+bad=[x for x in on if x in ('skills','todo','tom','summon','orchestrator')]
+sys.exit(1 if bad else 0)
+PY
+[ $? -eq 0 ] && P "extensoes de loop (skills/todo/tom/summon) desligadas" || F "extensao de loop ligada"
+# doutrina: sempre pesquisa (hook e agent sem gate de keyword)
+grep -q "SEMPRE pesquisa" ~/.agents/plugins/ragha-guard/scripts/research.sh 2>/dev/null && P "hook Desktop: pesquisa sempre" || F "hook Desktop ainda com gate"
+grep -q "SEMPRE" ~/.local/bin/agent 2>/dev/null && P "agent CLI: pesquisa sempre" || F "agent CLI ainda com gate"
+
+# --- E2E: tarefa que EXIGE internet + multi-passo + contagem shell ---
+echo "  … pre-aquecendo modelo…"
+MODEL="$(awk -F': ' '/^GOOSE_MODEL:/{print $2}' "$CFG")"
+curl -s --max-time 90 http://localhost:11434/api/generate -d "{\"model\":\"$MODEL\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":\"10m\"}" >/dev/null 2>&1
+echo "  … rodando tarefa E2E (pesquisa + arquivos + contagem)…"
+rm -rf "$TD"; mkdir -p "$TD"
+AGENT_NO_REFLECT=1 gtimeout -k 10 480 agent --no-verify "Pesquise a versao estavel ATUAL do Python (site oficial python.org) e faca, um passo de cada vez: 1) crie $TD/versao.txt contendo SO o numero da versao estavel atual do Python (ex 3.13.1), 2) crie $TD/nota.md com 1 frase citando essa versao, 3) conte com shell quantos arquivos $TD tem e grave em $TD/total.txt como 'total: N'. Prova de cada com cat." > "$LOG" 2>&1
+RC=$?
+
+# grades E2E
+grep -qiE "pesquisando info atual|contexto atualizado" "$LOG" && P "E2E: pesquisa disparou" || F "E2E: pesquisa NAO disparou"
+[ "$(grep -ciE 'Load Skill|retrieving.*memor|Load Skills n:' "$LOG")" = "0" ] && P "E2E: sem loop de memoria" || F "E2E: loop de memoria detectado"
+[ -f "$TD/versao.txt" ] && grep -qE '3\.[0-9]+' "$TD/versao.txt" && P "E2E: versao.txt com versao plausivel ($(cat "$TD/versao.txt" 2>/dev/null|tr -d '\n'|cut -c1-12))" || F "E2E: versao.txt ausente/sem versao"
+[ -f "$TD/nota.md" ] && [ -s "$TD/nota.md" ] && P "E2E: nota.md criado" || F "E2E: nota.md ausente/vazio"
+[ -f "$TD/total.txt" ] && grep -qE 'total: *[0-9]+' "$TD/total.txt" && P "E2E: total.txt com numero real ($(cat "$TD/total.txt" 2>/dev/null|tr -d '\n'))" || F "E2E: total.txt vazio/sem numero"
+# nao-invencao: a versao gravada bate com a pesquisa? (versao aparece no log de pesquisa)
+if [ -f "$TD/versao.txt" ]; then
+  v="$(grep -oE '3\.[0-9]+(\.[0-9]+)?' "$TD/versao.txt" | head -1)"
+  if [ -n "$v" ] && grep -q "$v" "$LOG"; then P "E2E: versao gravada veio da pesquisa (nao inventou: $v)"; else F "E2E: versao pode ter sido inventada (nao bate com pesquisa)"; fi
+fi
+
+# --- VISAO: o modelo de visao roteado le uma imagem? (visao e capacidade roteada, nao o default) ---
+VMODEL="qwen25vl-32k"
+if ollama show "$VMODEL" 2>/dev/null | grep -qi vision; then
+  MODEL="$VMODEL"
+  /Users/carvalho/.local/bin/uv run --quiet --with pillow python - <<'PY' 2>/dev/null
+from PIL import Image, ImageDraw, ImageFont
+img=Image.new('RGB',(480,240),(200,20,20)); d=ImageDraw.Draw(img)
+try: f=ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf",64)
+except: f=ImageFont.load_default()
+d.text((70,90),"RAGHA 42",fill=(255,255,255),font=f); img.save('/tmp/ragha-vtest.png')
+PY
+  B64=$(base64 -i /tmp/ragha-vtest.png 2>/dev/null)
+  VR=$(curl -s --max-time 90 http://localhost:11434/api/chat -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Que cor de fundo e que texto aparece? Curto.\",\"images\":[\"$B64\"]}]}" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('message',{}).get('content','')[:120])" 2>/dev/null)
+  if printf '%s' "$VR" | grep -qiE "vermelh|red" && printf '%s' "$VR" | grep -qiE "RAGHA|42"; then P "VISAO: leu imagem (cor+texto: $(printf '%s' "$VR"|tr -d '\n'|cut -c1-40))"; else F "VISAO: nao leu a imagem (resp: $(printf '%s' "$VR"|tr -d '\n'|cut -c1-40))"; fi
+  rm -f /tmp/ragha-vtest.png
+else
+  F "VISAO: modelo padrao NAO tem visao (meta pede visao)"
+fi
+
+tot=$((pass+fail))
+echo
+echo "== RESULTADO: $pass/$tot PASS =="
+if [ "$fail" = "0" ]; then echo "== 100% ACURACIA ✅ =="; exit 0; else printf "== FALHAS:%b\n" "$FAILS"; exit 1; fi

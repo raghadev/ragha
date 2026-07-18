@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# mac — CLI de controle do Mac pro agente (navegador/arquivos/apps).
+# Fonte UNICA de verdade: o MCP mactools tambem chama este CLI.
+# Feito p/ modelo fraco: ele chama via developer__shell (confiavel), nao precisa emitir tool_call MCP.
+#
+# Uso:
+#   mac browsers                         # lista navegadores instalados
+#   mac open-url URL [Navegador]         # abre URL (opcional: navegador especifico)
+#   mac traffic [Navegador] [limite]     # trafego de rede ao vivo do navegador/extensoes
+#   mac organize PASTA [ext|date]        # organiza arquivos soltos em subpastas
+#   mac make-app NOME url|command ALVO   # cria ~/Desktop/NOME.app (site ou comando)
+set -uo pipefail
+HOME_DIR="$HOME"
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  browsers)
+    found=()
+    for n in Safari "Google Chrome" Firefox "Microsoft Edge" Arc "Brave Browser" Opera Vivaldi; do
+      [ -d "/Applications/$n.app" ] && found+=("$n")
+    done
+    if [ "${#found[@]}" -eq 0 ]; then echo "nenhum navegador encontrado"; else
+      printf 'Navegadores instalados: '; printf '%s' "${found[0]}"; for i in "${found[@]:1}"; do printf ', %s' "$i"; done; printf '\n'
+    fi
+    ;;
+
+  open-url)
+    url="${1:-}"; browser="${2:-}"
+    [ -z "$url" ] && { echo "uso: mac open-url URL [Navegador]"; exit 2; }
+    case "$url" in http://*|https://*|file://*) ;; *) url="https://$url";; esac
+    if [ -n "$browser" ]; then
+      if open -a "$browser" "$url" 2>/tmp/mac.err; then echo "abri $url no $browser"; else echo "erro: $(cat /tmp/mac.err)"; exit 1; fi
+    else
+      open "$url" && echo "abri $url no navegador padrao"
+    fi
+    ;;
+
+  traffic)
+    browser="${1:-Google Chrome}"; limit="${2:-25}"
+    proc="${browser%% *}"
+    out=$(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | grep -iE "$proc" | awk '{print $9}' | sed 's/.*->//' | sort | uniq -c | sort -rn | head -"$limit")
+    if [ -z "$out" ]; then echo "nenhuma conexao ativa de '$browser' (o navegador esta aberto e navegando?)"; else
+      echo "Trafego ativo de '$browser' (conexoes -> host:porta):"; echo "$out"
+    fi
+    ;;
+
+  organize)
+    folder="${1:-}"; mode="${2:-ext}"
+    folder="${folder/#\~/$HOME_DIR}"
+    [ -d "$folder" ] || { echo "pasta nao existe: $folder"; exit 1; }
+    moved=0
+    while IFS= read -r src; do
+      name="$(basename "$src")"
+      case "$name" in .*) continue;; esac
+      if [ "$mode" = "date" ]; then
+        sub="$(date -r "$src" +%Y-%m 2>/dev/null || echo Outros)"
+      else
+        ext="$(echo "${name##*.}" | tr '[:upper:]' '[:lower:]')"
+        case "$ext" in
+          jpg|jpeg|png|gif|heic|webp|bmp|svg|tiff) sub=Imagens;;
+          pdf|doc|docx|txt|md|rtf|pages|odt)        sub=Documentos;;
+          xls|xlsx|csv|numbers)                     sub=Planilhas;;
+          mp4|mov|mkv|avi|webm)                     sub=Videos;;
+          mp3|wav|m4a|flac|aac)                     sub=Audio;;
+          zip|rar|7z|tar|gz|dmg)                    sub=Compactados;;
+          py|js|ts|sh|json|html|css|rs|go|c|cpp)    sub=Codigo;;
+          app|pkg)                                  sub=Apps;;
+          *)                                        sub=Outros;;
+        esac
+      fi
+      mkdir -p "$folder/$sub"
+      mv "$src" "$folder/$sub/" 2>/dev/null && moved=$((moved+1))
+    done < <(find "$folder" -maxdepth 1 -type f 2>/dev/null)
+    echo "organizados $moved arquivos em $folder (modo=$mode)"
+    ;;
+
+  make-app)
+    name="${1:-}"; kind="${2:-}"; target="${3:-}"
+    [ -z "$name" ] || [ -z "$kind" ] || [ -z "$target" ] && { echo "uso: mac make-app NOME url|command ALVO"; exit 2; }
+    app="$HOME_DIR/Desktop/$name.app"; macos="$app/Contents/MacOS"
+    mkdir -p "$macos"
+    if [ "$kind" = "url" ]; then body="#!/bin/bash
+open \"$target\""; else body="#!/bin/bash
+$target"; fi
+    printf '%s\n' "$body" > "$macos/$name"; chmod +x "$macos/$name"
+    id_clean="$(echo "$name" | tr '[:upper:] ' '[:lower:]-')"
+    cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>CFBundleName</key><string>$name</string>
+ <key>CFBundleExecutable</key><string>$name</string>
+ <key>CFBundlePackageType</key><string>APPL</string>
+ <key>CFBundleIdentifier</key><string>local.mac.$id_clean</string>
+</dict></plist>
+PLIST
+    printf 'APPL????' > "$app/Contents/PkgInfo"
+    xattr -cr "$app" 2>/dev/null || true
+    echo "app criado: $app (kind=$kind). Duplo-clique no Desktop pra usar."
+    ;;
+
+  ""|-h|--help|help)
+    grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,20p'
+    ;;
+  *)
+    echo "comando desconhecido: $cmd (rode 'mac help')"; exit 2;;
+esac

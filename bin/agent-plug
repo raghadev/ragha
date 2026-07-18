@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# agent-plug — onboarding universal de LLM no harness.
+# Puxa (se preciso), detecta function-calling + janela de contexto, assa variante -16k,
+# testa tool-calling (API) e e2e no Goose, e diz o veredito. Opcional: seta como ativo.
+#
+# Uso:
+#   agent-plug <modelo|hf.co/rep:tag> [alias] [--set]
+# Ex:
+#   agent-plug qwen3:4b qwen4b --set
+#   agent-plug hf.co/User/Repo-GGUF:Q4_K_M meumodelo
+set -uo pipefail
+API=http://localhost:11434
+CFG="$HOME/.config/goose/config.yaml"
+NEED_CTX=9000   # prompt do Goose (system+tools) ~8k; folga p/ conversa
+
+MODEL=""; ALIAS=""; SET=0
+for a in "$@"; do
+  case "$a" in
+    --set) SET=1;;
+    *) if [ -z "$MODEL" ]; then MODEL="$a"; elif [ -z "$ALIAS" ]; then ALIAS="$a"; fi;;
+  esac
+done
+[ -z "$MODEL" ] && { echo "uso: agent-plug <modelo|hf.co/rep:tag> [alias] [--set]"; exit 2; }
+
+ok(){ printf "  \033[32mOK\033[0m   %s\n" "$1"; }
+warn(){ printf "  \033[33mWARN\033[0m %s\n" "$1"; }
+bad(){ printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
+
+# alias limpo p/ a variante
+[ -z "$ALIAS" ] && ALIAS="$(echo "$MODEL" | sed 's#.*/##; s/:.*//; s/[^A-Za-z0-9]/-/g' | tr 'A-Z' 'a-z' | cut -c1-32)"
+VARIANT="${ALIAS}-16k"
+
+echo "== agent-plug: $MODEL -> $VARIANT =="
+
+# 0) Ollama no ar
+agent-doctor >/dev/null 2>&1 || { curl -s --max-time 3 $API/api/version >/dev/null || { bad "Ollama fora do ar"; exit 1; }; }
+
+# 1) Pull se ausente
+if ! ollama list 2>/dev/null | awk '{print $1}' | sed 's/:latest$//' | grep -qxF "${MODEL%:latest}"; then
+  echo "  baixando $MODEL ..."; ollama pull "$MODEL" 2>&1 | grep -iE "success|error" | tail -1 || true
+fi
+ollama list 2>/dev/null | awk '{print $1}' | sed 's/:latest$//' | grep -qxF "${MODEL%:latest}" || { bad "modelo nao disponivel apos pull"; exit 1; }
+ok "modelo disponivel: $MODEL"
+
+# 2) Capacidades: tools? contexto?
+SHOW="$(ollama show "$MODEL" 2>/dev/null)"
+CTX="$(printf '%s' "$SHOW" | awk '/context length/{print $NF; exit}')"
+[ -z "$CTX" ] && CTX=0
+HAS_TOOLS=0; printf '%s' "$SHOW" | grep -qiE "^\s*tools\s*$|[[:space:]]tools([[:space:]]|$)" && HAS_TOOLS=1
+# fallback: bloco Capabilities
+printf '%s' "$SHOW" | awk '/Capabilities/{f=1} f&&/tools/{print}' | grep -qi tools && HAS_TOOLS=1
+
+if [ "$HAS_TOOLS" = "1" ]; then ok "function-calling: suportado"; else warn "function-calling: NAO declarado (pode ser so chat)"; fi
+if [ "$CTX" -ge "$NEED_CTX" ] 2>/dev/null; then ok "janela de contexto: $CTX (>= $NEED_CTX)"; else warn "janela pequena: $CTX (< $NEED_CTX) -> desligue extensoes p/ modelos assim"; fi
+
+# 3) num_ctx alvo = min(CTX, 16384), minimo 8192
+TARGET=16384
+[ "$CTX" -gt 0 ] 2>/dev/null && [ "$CTX" -lt 16384 ] && TARGET="$CTX"
+[ "$TARGET" -lt 8192 ] 2>/dev/null && TARGET=8192
+# num_ctx + amostragem estavel (temp baixa = executa em vez de narrar; params deterministicos)
+printf 'FROM %s\nPARAMETER num_ctx %s\nPARAMETER temperature 0.2\nPARAMETER top_p 0.9\nPARAMETER top_k 40\nPARAMETER min_p 0.05\nPARAMETER repeat_penalty 1.1\n' "$MODEL" "$TARGET" > "/tmp/Mf.$ALIAS"
+ollama create "$VARIANT" -f "/tmp/Mf.$ALIAS" >/dev/null 2>&1 && ok "variante criada: $VARIANT (num_ctx=$TARGET)" || { bad "falha ao criar variante"; exit 1; }
+
+# 4) Smoke test tool-calling (API crua)
+TOOLTEST="$(curl -s --max-time 180 $API/api/chat -d '{
+  "model":"'"$VARIANT"'","stream":false,
+  "messages":[{"role":"user","content":"Write file /tmp/plug_probe.txt content OK. Use the write_file tool."}],
+  "tools":[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('YES' if d.get('message',{}).get('tool_calls') else 'NO')" 2>/dev/null)"
+if [ "$TOOLTEST" = "YES" ]; then ok "tool-calling REAL: emite tool_call"; TOOLS_OK=1; else warn "tool-calling REAL: nao emitiu tool_call"; TOOLS_OK=0; fi
+
+# 5) e2e no Goose (cria arquivo)
+rm -f /tmp/plug_e2e.txt
+AGENT_NO_REFLECT=1 GOOSE_MODE=auto GOOSE_MODEL="$VARIANT" goose run --no-session \
+  -t "Crie /tmp/plug_e2e.txt com o texto exato: plugado. Confirme com cat." >/dev/null 2>&1
+if [ "$(cat /tmp/plug_e2e.txt 2>/dev/null)" = "plugado" ]; then ok "e2e Goose: criou e verificou arquivo"; E2E=1; else warn "e2e Goose: nao completou (modelo fraco p/ agente)"; E2E=0; fi
+
+# 6) Veredito
+echo "== veredito =="
+if [ "$TOOLS_OK" = "1" ] && [ "$E2E" = "1" ]; then
+  VERDICT="READY (agente completo)"
+elif [ "$HAS_TOOLS" = "1" ] || [ "$TOOLS_OK" = "1" ]; then
+  VERDICT="PARCIAL (faz tool-call, mas e2e instavel — use p/ tarefas simples ou deixe a auto-escalacao cobrir)"
+else
+  VERDICT="CHAT-ONLY (sem function-calling — serve p/ conversa/reflexao, NAO como agente)"
+fi
+echo "  $VARIANT -> $VERDICT"
+
+# 6b) Limitacoes em linguagem LEIGA — o que voce PERDE com este modelo
+if [ "$TOOLS_OK" = "1" ] && [ "$E2E" = "1" ]; then
+  LIMITS="✅ Faz tudo: cria/edita arquivos, roda comandos, pesquisa na web, usa memoria."
+elif [ "$TOOLS_OK" = "1" ]; then
+  LIMITS="⚠️ Instavel em varias etapas (pode narrar em vez de executar). Bom p/ coisas simples; a auto-escalacao cobre o resto."
+else
+  LIMITS="❌ NAO age no seu Mac (sem function-calling): nao cria/edita arquivos, nao roda comandos, nao usa ferramentas. So conversa/responde texto."
+fi
+[ "$CTX" -lt "$NEED_CTX" ] 2>/dev/null && LIMITS="$LIMITS ⚠️ Memoria curta (janela $CTX): esquece rapido em tarefas longas."
+echo "  📋 O que esperar: $LIMITS"
+# notificacao nativa do macOS (linguagem leiga)
+osascript -e "display notification \"$LIMITS\" with title \"ragha — modelo $ALIAS\" sound name \"Ping\"" >/dev/null 2>&1 || true
+# arquivo p/ a UI mostrar
+mkdir -p "$HOME/.local/state/agent/model-limits"
+printf "%s" "$LIMITS" > "$HOME/.local/state/agent/model-limits/$VARIANT.txt"
+
+# 7) Registro + set opcional
+REG="$HOME/.local/state/agent/plugged.tsv"; mkdir -p "$(dirname "$REG")"
+printf "%s\t%s\tctx=%s\ttools=%s\te2e=%s\t%s\t%s\n" "$VARIANT" "$MODEL" "$TARGET" "$TOOLS_OK" "$E2E" "$VERDICT" "$LIMITS" >> "$REG"
+if [ "$SET" = "1" ]; then
+  if [ "${E2E:-0}" = "1" ] || [ "${TOOLS_OK:-0}" = "1" ]; then
+    python3 - "$CFG" "$VARIANT" <<'PY'
+import sys,re
+cfg,var=sys.argv[1],sys.argv[2]
+s=open(cfg).read()
+s=re.sub(r'^GOOSE_MODEL:.*$', 'GOOSE_MODEL: '+var, s, flags=re.M)
+s=re.sub(r'(\n  ollama:\n(?:.*\n)*?    model: ).*', r'\g<1>'+var, s, count=1)
+open(cfg,'w').write(s)
+PY
+    ok "definido como modelo ativo: $VARIANT"
+  else
+    warn "nao setei como ativo: modelo nao passou como agente"
+  fi
+fi
+echo "== fim (registro: $REG) =="
+
+# auto-diagnostico do modelo recem-plugado (detecta thinking-loop, sem-tools, estouro, etc)
+command -v agent-modelcheck >/dev/null 2>&1 && { echo; echo "== diagnostico automatico do modelo =="; agent-modelcheck "${MODEL:-${1:-}}" || true; }

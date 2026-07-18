@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# agent-selftest — bateria anti-regressao do stack do agente local.
+# Uso: agent-selftest [--full]   (--full adiciona teste e2e rodando o modelo)
+set -uo pipefail
+FULL=0; [ "${1:-}" = "--full" ] && FULL=1
+CFG="$HOME/.config/goose/config.yaml"
+GB="$HOME/.config/agent/guardbin"
+UV=/Users/carvalho/.local/bin/uv
+UVX=/Users/carvalho/.local/bin/uvx
+DEEPWEB="$HOME/.config/goose/mcp/deepweb/server.py"
+pass=0; fail=0
+P(){ printf "  \033[32mPASS\033[0m %s\n" "$1"; pass=$((pass+1)); }
+F(){ printf "  \033[31mFAIL\033[0m %s\n" "$1"; fail=$((fail+1)); }
+
+echo "== agent-selftest =="
+
+# T1 doctor
+if agent-doctor >/dev/null 2>&1; then P "doctor: stack saudavel"; else F "doctor: stack com falha"; fi
+
+# T2 guardbin bloqueia destrutivo
+if ( export PATH="$GB:$PATH"; rm -rf / 2>/dev/null ); then F "guardbin: rm -rf / NAO bloqueado"; else P "guardbin: rm -rf / bloqueado"; fi
+if ( export PATH="$GB:$PATH"; sudo true 2>/dev/null ); then F "guardbin: sudo NAO bloqueado"; else P "guardbin: sudo bloqueado"; fi
+
+# T3 modelos com num_ctx assado presentes
+for m in gemma4-unc-16k qwen3-16k; do
+  if ollama list 2>/dev/null | awk '{print $1}' | sed 's/:latest$//' | grep -qxF "$m"; then P "modelo presente: $m"; else F "modelo ausente: $m"; fi
+done
+
+# T4 compactacao configurada
+grep -q "^GOOSE_AUTO_COMPACT_THRESHOLD:" "$CFG" && P "auto-compaction configurada" || F "auto-compaction ausente no config"
+
+# T5 MCP ddgsearch expoe 'search'
+DDG=$(printf '%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'; sleep 3)
+echo "$DDG" | $UVX --quiet duckduckgo-mcp-server 2>/dev/null | grep -q '"search"' && P "MCP ddgsearch OK" || F "MCP ddgsearch nao respondeu 'search'"
+
+# T6 MCP deepweb expoe deepweb_search
+echo "$DDG" | $UV run --quiet --python 3.11 --with mcp --with "httpx[socks]" --with beautifulsoup4 "$DEEPWEB" 2>/dev/null | grep -q "deepweb_search" && P "MCP deepweb OK" || F "MCP deepweb nao respondeu 'deepweb_search'"
+
+# T6b auto-melhoria: script existe + secao gerenciada presente
+{ command -v agent-reflect >/dev/null 2>&1 && grep -q "LICOES:INICIO" "$HOME/.config/goose/.goosehints"; } \
+  && P "auto-melhoria (agent-reflect + secao) OK" || F "auto-melhoria ausente"
+
+# T6c memoria recuperavel: agent-mem responde stats
+{ command -v agent-mem >/dev/null 2>&1 && agent-mem stats 2>/dev/null | grep -q "licoes no store"; } \
+  && P "memoria recuperavel (agent-mem) OK" || F "agent-mem indisponivel"
+
+# T6d MCP agentmem (auto-gerido) expoe mem_add
+AM=$(printf '%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'; sleep 2)
+echo "$AM" | $UV run --quiet --python 3.11 --with mcp "$HOME/.config/goose/mcp/agentmem/server.py" 2>/dev/null | grep -q "mem_add" \
+  && P "MCP agentmem (auto-gerido) OK" || F "MCP agentmem falhou"
+
+# T6e cron de manutencao carregado
+launchctl list 2>/dev/null | grep -q "com.agent.memmaintenance" \
+  && P "cron manutencao (launchd) carregado" || F "cron manutencao ausente"
+
+# T6f onboarding universal disponivel
+command -v agent-plug >/dev/null 2>&1 && P "agent-plug (onboarding LLM) OK" || F "agent-plug ausente"
+
+# T6g guardiao de config (anti-drift do Desktop)
+{ command -v agent-config-guard >/dev/null 2>&1 && [ -f "$HOME/.config/agent/config.canonical.yaml" ]; } \
+  && P "guardiao de config (canonical) OK" || F "guardiao de config ausente"
+
+# T6h leigo-friendly: UI web + botao 1-clique + backup + prewarm
+{ command -v agent-ui >/dev/null 2>&1 && curl -s --max-time 4 -o /dev/null -w "%{http_code}" http://127.0.0.1:8799/ 2>/dev/null | grep -q 200 || command -v agent-ui >/dev/null 2>&1; } \
+  && P "UI web (agent-ui) presente" || F "agent-ui ausente"
+ls "$HOME/Desktop/"*agha*.command >/dev/null 2>&1 && P "botao 1-clique (Ragha .command) OK" || F "botao 1-clique ausente"
+{ [ -x "$HOME/Desktop/ragha.app/Contents/MacOS/ragha" ] && [ -f "$HOME/.local/bin/agent-app.py" ] && [ -f "$HOME/Desktop/ragha.app/Contents/Resources/ragha.icns" ]; } \
+  && P "app desktop Ragha (.app leve WebKit + icone) OK" || F "app Ragha ausente/incompleto"
+{ command -v agent-backup >/dev/null 2>&1 && command -v agent-prewarm >/dev/null 2>&1; } \
+  && P "backup + prewarm OK" || F "backup/prewarm ausente"
+{ command -v agent-routine >/dev/null 2>&1 && command -v agent-skill >/dev/null 2>&1; } \
+  && P "rotinas + skills (scripts) OK" || F "rotinas/skills ausente"
+{ [ -f "$HOME/.agents/plugins/ragha-guard/hooks/hooks.json" ] && echo '{"tool_input":{"command":"sudo x"}}' | "$HOME/.agents/plugins/ragha-guard/scripts/guard.sh" | grep -q block; } \
+  && P "hook guardbin no Goose (PreToolUse bloqueia) OK" || F "hook guardbin ausente/nao bloqueia"
+{ echo '{"last_assistant_message":"rodei shell(command=x)"}' | "$HOME/.agents/plugins/ragha-guard/scripts/stopcheck.sh" 2>/dev/null | grep -q block; } \
+  && P "rede anti-narracao no Goose (Stop hook) OK" || F "Stop hook ausente/nao bloqueia"
+
+# T7 (full) e2e: agente cria arquivo
+if [ "$FULL" = "1" ]; then
+  rm -f /tmp/selftest_e2e.txt
+  AGENT_NO_REFLECT=1 agent --model qwen3-16k "Crie /tmp/selftest_e2e.txt com o texto: selftest_ok. Confirme com cat." >/dev/null 2>&1
+  [ "$(cat /tmp/selftest_e2e.txt 2>/dev/null)" = "selftest_ok" ] && P "e2e: agente criou arquivo" || F "e2e: arquivo nao criado"
+fi
+
+echo "== resultado: $pass PASS / $fail FAIL =="
+[ "$fail" = "0" ]

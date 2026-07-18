@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# guardbin/rm — bloqueia rm recursivo em raizes perigosas; passa o resto.
+REAL=/bin/rm
+recursive=0
+for a in "$@"; do case "$a" in -*[rR]*) recursive=1;; esac; done
+if [ "$recursive" = "1" ]; then
+  for a in "$@"; do
+    case "$a" in -*) continue;; esac
+    case "$a" in
+      /|/Users|/Users/|"$HOME"|"$HOME"/|/System|/System/*|/Library|/Applications|/opt|/opt/*|/usr|/usr/*|/bin|/sbin|/etc|/var|/private|"*"|"/*"|"~"|"~/"|.|..)
+        echo "[guardbin] BLOQUEADO: 'rm -r' em caminho perigoso -> $a" >&2
+        echo "[guardbin] se for intencional, rode manualmente no terminal." >&2
+        exit 13;;
+    esac
+  done
+fi
+exec "$REAL" "$@"

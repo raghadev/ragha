@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "[guardbin] BLOQUEADO: agente nao usa 'sudo'. Rode manualmente se necessario." >&2
+exit 13

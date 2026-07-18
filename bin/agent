@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# agent — runner robusto do agente local (Goose + Ollama).
+# Garante o stack no ar, roda a tarefa com retries em erro transitório, e loga.
+#
+# Uso:
+#   agent "sua tarefa aqui"
+#   agent --model qwen3-16k "tarefa"       # troca o modelo só nesta run
+#   agent --deepweb "tarefa"               # garante Tor no ar p/ dark web
+#   agent --chat "conversa"                # modo conversa (sem auto-exec de tools)
+set -uo pipefail
+
+LOGDIR="$HOME/.local/state/agent"; mkdir -p "$LOGDIR"
+LOG="$LOGDIR/agent.log"
+CFG="$HOME/.config/goose/config.yaml"
+
+# Guarda-costas: wrappers que bloqueiam comandos destrutivos entram na frente do PATH.
+export PATH="$HOME/.config/agent/guardbin:$PATH"
+
+MODEL_OVERRIDE=""; WANT_TOR=0; MODE="auto"; ESCALATE=1; AUTO=0; RESEARCH=1; VERIFY=-1; FALLBACK="gemma4-agentic-16k"; DOCTOR_ARGS=()
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)       MODEL_OVERRIDE="$2"; DOCTOR_ARGS+=(--model "$2"); shift 2;;
+    --deepweb)     WANT_TOR=1; DOCTOR_ARGS+=(--deepweb); shift;;
+    --chat)        MODE="chat"; shift;;
+    --no-escalate) ESCALATE=0; shift;;
+    --auto)        AUTO=1; shift;;
+    --verify)      VERIFY=1; shift;;
+    --no-verify)   VERIFY=0; shift;;
+    --no-research) RESEARCH=0; shift;;
+    --fallback)    FALLBACK="$2"; shift 2;;
+    *)             ARGS+=("$1"); shift;;
+  esac
+done
+PROMPT="${ARGS[*]:-}"
+if [ -z "$PROMPT" ]; then echo "uso: agent [--model X] [--deepweb] [--chat] \"tarefa\""; exit 2; fi
+
+# 1) Preflight (auto-repara deps caídas)
+agent-doctor ${DOCTOR_ARGS[@]+"${DOCTOR_ARGS[@]}"} || { echo "[agent] stack não saudável, veja acima"; exit 1; }
+
+# 1b) Memoria recuperavel: injeta SO as licoes mais relevantes desta tarefa
+# no bloco LICOES do .goosehints. Mantem o contexto constante (nao incha no tempo).
+command -v agent-mem >/dev/null 2>&1 && agent-mem inject "$PROMPT" 5 >/dev/null 2>&1 || true
+
+# 1c) Aviso leigo de RAM baixa
+FREE=$(memory_pressure 2>/dev/null | awk -F: '/free percentage/{gsub(/[ %]/,"",$2);print $2}')
+[ -n "${FREE:-}" ] && [ "$FREE" -lt 12 ] 2>/dev/null && \
+  echo "  💡 RAM quase cheia (${FREE}% livre). Dica: feche o Chrome, ou use um modelo leve (--model qwen3-16k)."
+
+ts(){ date "+%Y-%m-%d %H:%M:%S"; }
+
+# 1d) DEEP RESEARCH AUTOMATICA — SEMPRE (meta do usuario: nunca inventar, sempre dados atuais).
+# Model-agnostic: qualquer modelo age atualizado, sem depender da memoria de treino.
+# Pula pesquisa SO em op local pura trivial (listar/mostrar/apagar caminho local, sem conteudo).
+SKIP_RESEARCH=0
+printf "%s" "$PROMPT" | grep -qiE '^(liste?|mostr|exib|apag|delet|remov|abra|feche|rode|execute) ' \
+  && ! printf "%s" "$PROMPT" | grep -qiE "como|porque|melhor|atual|versao|pesquis|explica|o que|resumo|conteudo|sobre " \
+  && SKIP_RESEARCH=1
+if [ "$RESEARCH" = "1" ] && [ "$SKIP_RESEARCH" = "0" ]; then
+  echo "  🔎 pesquisando info atual antes de agir…"
+  RES="$("$HOME/.local/bin/uv" run --quiet --with ddgs --with httpx --with beautifulsoup4 python "$HOME/.local/bin/agent-research" "$PROMPT" 3 2>/dev/null)"
+  if [ -n "$RES" ]; then
+    PROMPT="$RES
+
+--- TAREFA DO USUARIO (use os fatos frescos acima; NAO invente valores, use os fatos) ---
+$PROMPT"
+    echo "  ✓ contexto atualizado injetado"
+  else
+    echo "  ⚠ pesquisa vazia (rede?), seguindo — modelo avisado a nao inventar"
+    PROMPT="[SEM internet agora: NAO invente valores/versoes; diga 'nao achei fonte' se precisar de dado atual]
+
+$PROMPT"
+  fi
+fi
+
+echo "[$(ts)] TASK: $PROMPT" >>"$LOG"
+
+# Roda a tarefa num modelo, com retries em erro transitorio.
+# Retorna: 0 ok | 1 falha/erro | 3 estouro de contexto. Ecoa saida.
+run_model() {
+  local model="$1" env_arr=(GOOSE_MODE="$MODE") max=3 attempt=0 out narr_retry=0
+  [ -n "$model" ] && env_arr+=(GOOSE_MODEL="$model")
+  while [ $attempt -lt $max ]; do
+    attempt=$((attempt+1))
+    out="$(env "${env_arr[@]}" goose run --no-session -t "$PROMPT" 2>&1)"
+    printf "%s\n" "$out"
+    printf "[%s] model=%s attempt=%d:\n%s\n" "$(ts)" "${model:-default}" "$attempt" "$out" >>"$LOG"
+    if printf "%s" "$out" | grep -qiE "exceeds the available context size"; then
+      echo "[agent] estouro de contexto (model=$model)." | tee -a "$LOG"
+      echo "  💡 Em portugues: esse modelo tem janela pequena pra tantas ferramentas."
+      echo "     Solucao: use um modelo 16k -> 'agent-plug NOME-DO-MODELO' ou escolha outro na UI."
+      return 3
+    fi
+    if printf "%s" "$out" | grep -qiE "Ran into this error|Request failed|error sending request|connection refused|reset before headers"; then
+      echo "[agent] erro transitorio -> reinicia ollama, retry ($attempt/$max)" | tee -a "$LOG"
+      echo "  💡 Em portugues: o motor de IA (Ollama) tropecou; estou reiniciando e tentando de novo."
+      brew services restart ollama >/dev/null 2>&1
+      for i in $(seq 1 20); do curl -s --max-time 2 http://localhost:11434/api/version >/dev/null 2>&1 && break; sleep 1; done
+      continue
+    fi
+    # REDE 1 (anti-narracao): tool-call escrito como texto/pseudo-codigo, sem tool real executada.
+    # Cobre pseudo-codigo shell/python E narracao de tools MCP (ex: make_app(...), organize_files(...)).
+    local force=0
+    if printf "%s" "$out" | grep -qE 'shell\(command=|```python|```bash|```tool|(make_app|organize_files|open_url|browser_traffic|list_browsers|web_scrape|rag_search|rag_add|mem_add|mem_search|deepweb_search)\(' \
+       && ! printf "%s" "$out" | grep -qE '▸ (shell|search|write|edit|read|rag_|mem_|deepweb|web_scrape|make_app|organize_files|open_url|browser_traffic|list_browsers)'; then
+      force=1
+    fi
+    # REDE 2 (verificacao aterrada): alegou sucesso mas um arquivo citado na tarefa NAO existe.
+    if [ "$force" = "0" ] && printf "%s" "$out" | grep -qiE "criad|created|sucesso|conclu|feito|pronto"; then
+      for p in $(printf "%s" "$PROMPT" | grep -oE '(/tmp/[A-Za-z0-9._/-]+|/Users/[A-Za-z0-9._/-]+|~/[A-Za-z0-9._/-]+)'); do
+        pe="${p/#\~/$HOME}"
+        [ -e "$pe" ] || force=1
+      done
+    fi
+    if [ "$force" = "1" ] && [ "$narr_retry" = "0" ]; then
+      narr_retry=1
+      echo "[agent] modelo NARROU/alegou sem prova -> forcando execucao real" | tee -a "$LOG"
+      out="$(env "${env_arr[@]}" goose run --no-session -t "Voce NAO executou de verdade (escreveu como texto ou alegou sem prova). Execute AGORA chamando as ferramentas REAIS (shell/search/etc), NAO escreva pseudo-codigo, mostre a saida real. Tarefa: $PROMPT" 2>&1)"
+      printf "%s\n" "$out"
+      printf "[%s] model=%s FORCE-RETRY:\n%s\n" "$(ts)" "${model:-default}" "$out" >>"$LOG"
+    fi
+    # sinal de incapacidade do modelo (falha "soft")
+    if printf "%s" "$out" | grep -qiE "nao consegui|não consegui|unable to|could not|couldn't|desculp|não foi possível|nao foi possivel"; then
+      return 1
+    fi
+    return 0
+  done
+  return 1
+}
+
+PRIMARY="$MODEL_OVERRIDE"
+[ -z "$PRIMARY" ] && PRIMARY="$(awk -F': ' '/^GOOSE_MODEL:/{print $2}' "$CFG")"
+
+# Roteador de VISAO: tarefa cita imagem/print/foto OU caminho de imagem -> modelo com visao.
+# Assim o agente "ve" quando precisa, mas usa o modelo agentico rapido no resto.
+VISION_MODEL="qwen25vl-32k"
+if [ -z "$MODEL_OVERRIDE" ] && printf "%s" "$PROMPT" | grep -qiE "imagem|image|foto|print( |-|screen)|screenshot|captura de tela|\.png|\.jpe?g|\.webp|\.gif|leia? a tela|veja? (a|na|essa) (tela|imagem|foto)|descreva.*(imagem|foto|tela|print)"; then
+  if ollama list 2>/dev/null | awk '{print $1}' | grep -qxF "$VISION_MODEL:latest" || ollama list 2>/dev/null | awk '{print $1}' | grep -qxF "$VISION_MODEL"; then
+    PRIMARY="$VISION_MODEL"
+    echo "  👁 tarefa com imagem -> usando modelo de visao ($VISION_MODEL)"
+  fi
+fi
+
+# Roteador --auto: tarefa curta/simples -> modelo leve rapido; complexa -> 12B
+if [ "$AUTO" = "1" ] && [ -z "$MODEL_OVERRIDE" ]; then
+  wc_n=$(printf "%s" "$PROMPT" | wc -w | tr -d ' ')
+  if [ "${wc_n:-0}" -lt 12 ] 2>/dev/null && ! printf "%s" "$PROMPT" | grep -qiE "codig|code|script|programa|multi|passos|refator|debug|compil|analis"; then
+    PRIMARY="qwen3-16k"
+  else
+    PRIMARY="gemma4-unc-16k"
+  fi
+  echo "[agent] --auto -> modelo: $PRIMARY (palavras=$wc_n)"
+fi
+
+run_model "$PRIMARY"; rc=$?
+
+# Auto-escalacao: se falhou e nao era o modelo forte, sobe pro FALLBACK.
+if [ "$rc" != "0" ] && [ "$ESCALATE" = "1" ] && [ "$PRIMARY" != "$FALLBACK" ]; then
+  echo "[agent] modelo '$PRIMARY' nao deu conta (rc=$rc) -> escalando para '$FALLBACK'" | tee -a "$LOG"
+  agent-doctor --model "$FALLBACK" >/dev/null 2>&1
+  run_model "$FALLBACK"; rc=$?
+fi
+
+# 3b) VERIFICACAO pelo modelo FORTE (garante saida correta mesmo com modelo burro).
+# -1 = auto: verifica sempre que o primario NAO for o modelo forte. Corrige o "311 vs 3.14.6".
+do_verify=0
+[ "$VERIFY" = "1" ] && do_verify=1
+{ [ "$VERIFY" = "-1" ] && [ "$PRIMARY" != "$FALLBACK" ]; } && do_verify=1
+if [ "$do_verify" = "1" ]; then
+  echo "[agent] conferindo o resultado com o modelo forte ($FALLBACK)…" | tee -a "$LOG"
+  vout="$(env GOOSE_MODE=auto GOOSE_MODEL="$FALLBACK" goose run --no-session -t "Confira se esta tarefa foi cumprida CORRETAMENTE: '$PROMPT'. Use as ferramentas de verdade para conferir (leia com cat os arquivos citados; compare valores com os fatos atuais). Se houver QUALQUER erro, valor incorreto ou parte faltando, CORRIJA agora executando as ferramentas e mostre a prova final. Se estiver tudo certo, so confirme com a prova." 2>&1)"
+  printf "%s\n" "$vout"
+  printf "[%s] VERIFY(%s):\n%s\n" "$(ts)" "$FALLBACK" "$vout" >>"$LOG"
+fi
+
+# 4) Auto-melhoria: reflete sobre o episodio em background (nao bloqueia a saida).
+if [ "${AGENT_NO_REFLECT:-0}" != "1" ] && command -v agent-reflect >/dev/null 2>&1; then
+  RF="$LOGDIR/last_episode.txt"
+  { echo "TASK:"; echo "$PROMPT"; echo "===OUTPUT==="; tail -c 6000 "$LOG"; } > "$RF" 2>/dev/null
+  ( nohup sh -c 'agent-reflect "$1"; command -v agent-mem >/dev/null 2>&1 && agent-mem consolidate' _ "$RF" >>"$LOGDIR/reflect.log" 2>&1 & ) >/dev/null 2>&1
+fi
+exit $rc

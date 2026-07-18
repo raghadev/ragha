@@ -1,0 +1,74 @@
+version: "1.0.0"
+title: "Tarefa Grande"
+description: "Executa uma tarefa gigante em passos pequenos, salvando o progresso num arquivo (ledger) ate 100% concluida. Nunca estoura memoria: le so 1 passo por vez."
+
+# Modelo SEM thinking-loop p/ o loop-ledger rodar liso (qwen3vl divaga demais aqui).
+# Trocar p/ qwen3vl-16k depois do patch think:false [P1].
+settings:
+  goose_provider: "ollama"
+  goose_model: "gemma4-agentic-16k"
+  temperature: 0.15
+
+parameters:
+  - key: tarefa
+    input_type: string
+    requirement: required
+    description: "A tarefa grande que voce quer realizar do inicio ao fim"
+  - key: ledger
+    input_type: string
+    requirement: optional
+    default: "/tmp/ragha-ledger.md"
+    description: "Arquivo onde o progresso fica salvo (o 'caderno' da tarefa)"
+
+prompt: |
+  COMECE AGORA (um ciclo = um passo). Faca, nesta ordem, chamando ferramentas de VERDADE:
+  1. `cat {{ ledger }}` (ferramenta shell).
+  2. Se o ledger estiver VAZIO ou nao existir: planeje a tarefa "{{ tarefa }}" em passos `- [ ]` e escreva no {{ ledger }} com printf. Depois `cat {{ ledger }}` e PARE.
+  3. Se ja tiver passos: pegue o PRIMEIRO `- [ ]`, execute SO ele, verifique a prova, troque pra `- [x]` no {{ ledger }}, e PARE.
+  Um passo por ciclo. Nunca invente conclusao. Siga o protocolo detalhado das instrucoes.
+
+instructions: |
+  Voce executa uma tarefa GRANDE sem estourar memoria, usando um arquivo de progresso (o "ledger") em {{ ledger }}.
+  O estado da tarefa vive NO ARQUIVO, nunca na sua cabeca. Voce faz UM passo por vez.
+
+  PROTOCOLO (siga a risca, sempre chamando ferramentas de VERDADE e esperando a saida real):
+
+  1. LER: rode `cat {{ ledger }}` (com a ferramenta shell).
+     - Se o arquivo NAO existe ou esta vazio: e a 1a vez. Va pro passo 2 (PLANEJAR).
+     - Se ja existe com passos: PULE pro passo 3 (EXECUTAR).
+
+  2. PLANEJAR (so na 1a vez): quebre a tarefa abaixo em passos pequenos e concretos.
+     Escreva o plano no ledger, um passo por linha no formato exato `- [ ] descricao do passo`.
+     No fim adicione a linha `## criterio: <como saber que a tarefa toda esta 100% pronta>`.
+     Tarefa a planejar: "{{ tarefa }}"
+     Use: `printf '%s\n' '- [ ] passo1' '- [ ] passo2' ... > {{ ledger }}`. Depois `cat {{ ledger }}` pra conferir. PARE.
+
+  3. EXECUTAR UM passo: pegue o PRIMEIRO passo marcado `- [ ]` (nao feito) do ledger.
+     Faca SO esse passo, chamando as ferramentas reais (shell, mactools, web, etc). Espere a saida real.
+
+  4. VERIFICAR: confirme com um comando (`cat`, `ls`, `curl`) que o passo deu certo de verdade.
+
+  5. MARCAR: troque aquele `- [ ]` por `- [x]` no ledger e anexe embaixo `    -> prova: <saida curta real>`.
+     Use `sed -i '' 's/- \[ \] EXATODESCRICAO/- [x] EXATODESCRICAO/' {{ ledger }}` ou a ferramenta edit.
+     Confirme com `grep -n 'EXATODESCRICAO' {{ ledger }}`.
+
+  6. PARAR: se ainda houver qualquer `- [ ]` no ledger, PARE agora (o sistema te chama de novo pro proximo passo).
+     NAO tente fazer varios passos numa vez so — um por ciclo.
+
+  Se um passo FALHAR: marque `- [!] descricao (erro: motivo curto)` e tente outra abordagem no proximo ciclo.
+  Nunca invente conclusao: so marque `- [x]` com prova real na tela.
+
+# Conferencia automatica: se ainda sobra algum "- [ ]", a checagem FALHA de proposito,
+# o Goose limpa a memoria e roda de novo (proximo passo). Quando nao sobra nenhum "- [ ]",
+# a checagem PASSA e a tarefa toda esta concluida.
+retry:
+  max_retries: 40
+  timeout: 1800
+  checks:
+    - type: shell
+      command: "test -f {{ ledger }} && ! grep -qE '^- \\[ \\]' {{ ledger }}"
+  on_failure: "echo '[tarefa-grande] ainda ha passos pendentes -> proximo ciclo'"
+
+# Botao no Desktop do Goose (aparece na tela pro usuario clicar)
+activities:
+  - "Rodar uma tarefa grande do inicio ao fim"

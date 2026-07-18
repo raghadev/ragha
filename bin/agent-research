@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""
+agent-research — pesquisa web PREVIA e condensada. O harness roda isto ANTES da tarefa
+e injeta o resultado no contexto, pra QUALQUER modelo (mesmo burro) agir com info atual.
+Uso: agent-research "consulta" [n]
+Imprime um bloco curto "PESQUISA WEB (fresca)" com fontes. Silencioso se nada achar.
+"""
+import sys, re
+
+def main():
+    if len(sys.argv) < 2:
+        return
+    query = sys.argv[1].strip()
+    k = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+    try:
+        from ddgs import DDGS
+    except Exception:
+        try:
+            from duckduckgo_search import DDGS
+        except Exception as e:
+            print(f"[research indisponivel: {e}]"); return
+    try:
+        results = list(DDGS().text(query, max_results=k))
+    except Exception as e:
+        print(f"[research falhou: {e}]"); return
+    if not results:
+        return
+    # CONCISO (modelo pequeno afoga com muito texto): so 3 resultados, snippet curto, sem excerto grande.
+    out = ["FATOS ATUAIS DA WEB (use estes; nao a memoria de treino):"]
+    for r in results[:3]:
+        t = (r.get("title") or "").strip()[:70]
+        u = (r.get("href") or r.get("url") or "").strip()
+        b = re.sub(r"\s+", " ", (r.get("body") or "")).strip()[:110]
+        out.append(f"- {t}: {b} [{u}]")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

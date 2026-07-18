@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# agent-repatch — re-aplica o binario Goose patchado no Desktop se um update do Goose
+# tiver revertido. Detecta pela ausencia da string do patch. Idempotente.
+set -uo pipefail
+APPBIN="/Applications/Goose.app/Contents/Resources/bin/goose"
+PATCHED="$HOME/.config/agent/goose-patches/goose-patched-bin"
+MARK="CONTEXTO FRESCO"   # string unica do patch de injecao
+
+[ -f "$PATCHED" ] || { echo "[repatch] binario patchado nao encontrado ($PATCHED)"; exit 1; }
+[ -f "$APPBIN" ] || { echo "[repatch] Goose.app nao instalado"; exit 0; }
+
+if grep -aqm1 "$MARK" "$APPBIN" 2>/dev/null; then
+  exit 0   # ja patchado, nada a fazer
+fi
+
+echo "[repatch] Desktop sem patch (update do Goose?) -> re-aplicando…"
+cp "$APPBIN" "$APPBIN.stock.$(date +%Y%m%d)" 2>/dev/null || true
+cp "$PATCHED" "$APPBIN"
+codesign --remove-signature "$APPBIN" 2>/dev/null || true
+codesign --force --sign - "$APPBIN" 2>/dev/null || true
+xattr -dr com.apple.quarantine "$APPBIN" 2>/dev/null || true
+if grep -aqm1 "$MARK" "$APPBIN" 2>/dev/null; then
+  echo "[repatch] OK — binario patchado re-aplicado no Goose Desktop"
+else
+  echo "[repatch] FALHA ao re-aplicar"; exit 1
+fi

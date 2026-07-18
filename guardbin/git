@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# bloqueia push --force; passa o resto
+REAL=""; for d in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do [ -x "$d/git" ] && { REAL="$d/git"; break; }; done
+push=0; force=0
+for a in "$@"; do
+  [ "$a" = "push" ] && push=1
+  case "$a" in --force|--force-with-lease|-f) force=1;; +*) [ "$push" = "1" ] && force=1;; esac
+done
+if [ "$push" = "1" ] && [ "$force" = "1" ]; then
+  echo "[guardbin] BLOQUEADO: 'git push --force'. Rode manualmente se for intencional." >&2
+  exit 13
+fi
+exec "$REAL" "$@"
