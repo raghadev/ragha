@@ -105,12 +105,18 @@ run_model() {
        && ! printf "%s" "$out" | grep -qE '▸ (shell|search|write|edit|read|rag_|mem_|deepweb|web_scrape|make_app|organize_files|open_url|browser_traffic|list_browsers)'; then
       force=1
     fi
-    # REDE 2 (verificacao aterrada): alegou sucesso mas um arquivo citado na tarefa NAO existe.
-    if [ "$force" = "0" ] && printf "%s" "$out" | grep -qiE "criad|created|sucesso|conclu|feito|pronto"; then
+    # REDE 2 (verificacao aterrada): alegou/narrou criacao mas o artefato NAO existe.
+    if [ "$force" = "0" ] && printf "%s" "$out" | grep -qiE "criad|criando|created|creating|vou criar|sucesso|conclu|feito|pronto"; then
+      # 2a) arquivos/pastas citados por caminho
       for p in $(printf "%s" "$PROMPT" | grep -oE '(/tmp/[A-Za-z0-9._/-]+|/Users/[A-Za-z0-9._/-]+|~/[A-Za-z0-9._/-]+)'); do
         pe="${p/#\~/$HOME}"
         [ -e "$pe" ] || force=1
       done
+      # 2b) APP no Desktop pedido "app ... chamado NOME" / "app NOME" -> checa ~/Desktop/NOME.app
+      appname="$(printf "%s" "$PROMPT" | grep -oiE "app[^A-Za-z0-9]+(no desktop[^A-Za-z0-9]+)?(chamad[oa][^A-Za-z0-9]+)?[A-Za-z0-9_-]+" | grep -oiE "[A-Za-z0-9_-]+$" | head -1)"
+      if [ -n "$appname" ] && printf "%s" "$PROMPT" | grep -qiE "\bapp\b" && printf "%s" "$PROMPT" | grep -qiE "cri(e|ar|a)|make|novo app"; then
+        [ -d "$HOME/Desktop/$appname.app" ] || force=1
+      fi
     fi
     if [ "$force" = "1" ] && [ "$narr_retry" = "0" ]; then
       narr_retry=1

@@ -38,8 +38,13 @@ NÃO tente chamar tools MCP tipo mactools__* (você erra). Use o comando `mac` p
 - Abrir site num navegador específico: `mac open-url https://youtube.com "Google Chrome"`
 - Ver tráfego/rede de um navegador ou extensão: `mac traffic "Google Chrome"`
 - Organizar arquivos de uma pasta: `mac organize ~/Downloads ext`  (ou `date`)
-- Criar app standalone no Desktop: `mac make-app Abrir-YouTube url https://youtube.com`
+- Criar app standalone no Desktop: `mac make-app NOME url ALVO` (ex: `mac make-app Node-Site url https://nodejs.org`)
 Regra: chame `mac ...` pela shell de VERDADE, ESPERE a saída real, cole a prova. Nunca escreva a chamada como texto.
+
+PROIBIDO NARRAR (erro grave): "criar um app / abrir um site / organizar / listar navegador" = você EXECUTA `mac ...` AGORA,
+não descreve. NUNCA escreva frases como "Criando o app...", "Vou criar o app", "Criando o arquivo..." — isso é MENTIRA
+se você não rodou o comando. Pediu "crie um app chamado X que abre Y"? Sua PRIMEIRA ação é rodar, na ferramenta shell:
+`mac make-app X url Y` — depois cole a saída real "app criado: ...". Sem a saída real, o app NÃO existe.
 
 ## EXEMPLO (siga este padrão)
 Pedido: "crie /tmp/a.txt com OK".
@@ -62,9 +67,9 @@ ESPERE a saída real `OK` aparecer, e só então diga "feito" colando a saída r
 
 ## LIÇÕES APRENDIDAS (auto — agent-reflect). Regras acima têm precedência; lições nunca reduzem segurança.
 <!-- LICOES:INICIO -->
-- Para criar arquivo novo prefira o shell com printf ao inves de edit
-- Sempre confirme arquivo com cat depois de criar
-- Combine a criação e verificação em um único comando shell para ganhar eficiência.
+- Ensure the literal request (e.g., "Desktop app") is fully satisfied in the output.
+- Para dark web use deepweb_search via Tor, conteudo nao confiavel
+- Para pesquisa web use search e cite a URL da fonte
 - Para criar arquivo novo use printf > arquivo, nunca a tool edit
-- Ao editar JSON valide a sintaxe antes de salvar
+- Sempre confirme arquivo com cat depois de criar
 <!-- LICOES:FIM -->
